@@ -1,0 +1,542 @@
+---
+sidebar_label: SSH CEL Roles
+description: |-
+    Adds Common Expression Language (CEL) roles to OpenBao's SSH secrets engine
+    for building and validating SSH certificates.
+---
+
+# CEL Roles for SSH Certificates
+
+**Status**: draft, not yet proposed.
+
+## Summary
+
+This RFC adds [Common Expression Language (CEL)](https://github.com/google/cel-spec) roles to the
+SSH secrets engine's certificate signing. It follows the [best practices for CEL](cel-best-practices.mdx)
+and the shape of the [PKI CEL roles](cel-pki.mdx). A CEL role is a program, not a set of role
+flags. It sees the request, the public key to be signed, and the caller's identity. It returns
+one of three things:
+
+- the complete certificate template,
+- a string explaining why the request was refused, or
+- `false`.
+
+OpenBao still owns the protocol-level parts: key parsing, serial, nonce, issuer resolution, the
+signature, and a small set of safety invariants. Everything about *who* gets a certificate and
+*what* it says belongs to the program.
+
+The program can call helpers that implement the existing role checks: principal allow-lists,
+host domain rules, allowed key types and lengths, and permitted options. It can also evaluate a
+whole classic role and then adjust the result.
+
+---
+
+## Problem Statement
+
+The SSH role (`ssh/roles/:name`) describes certificates through a growing list of flags:
+
+- `allowed_users` / `allowed_users_template`
+- `default_user` / `default_user_template`
+- `allowed_domains` / `allowed_domains_template`
+- `allow_bare_domains`, `allow_subdomains`
+- `allowed_critical_options`, `default_critical_options`
+- `allowed_extensions`, `default_extensions` / `default_extensions_template`
+- `allowed_user_key_lengths`, `key_id_format`, `allow_user_key_ids`, `allow_empty_principals`
+- `allow_user_certificates`, `allow_host_certificates`
+- `ttl`, `max_ttl`, `not_before_duration`, `algorithm_signer`, `issuer_ref`
+
+Each flag is a fixed, independent rule. Templating, where it exists, is ACL-style identity
+templating applied to one field at a time, or completely custom like for `key_id_format`.
+
+That leaves common requirements out of reach without changing OpenBao:
+
+- **Certificates derived from identity.** Examples:
+  - Put the user's IdP identity (e.g. an Entra ID UPN from an OIDC alias's metadata) and the
+    issue time into `key_id`, so every sshd log line names a person rather than a token.
+  - Grant principals from identity group membership instead of a static list.
+
+  Today `key_id_format` only knows `token_display_name`, `role_name` and `public_key_hash`.
+  Adding identity values to it means another flag and another templating dialect.
+- **Validating fields together.** Roles validate each request field on its own. They cannot
+  say:
+  - "a user certificate valid for more than an hour must carry a `source-address` critical
+    option";
+  - "the `backup` principal is only issued with a `force-command`";
+  - "host certificates for these domains use this issuer, those use another".
+- **Per-request choices.** The issuer, signature algorithm and validity window are fixed per
+  role. Choosing them from the request or the identity means one role per combination.
+
+Every new requirement so far has been met with a new flag.  CEL ends that cycle in the way
+the PKI engine already has.
+
+---
+
+## User-facing Description
+
+**Administrators** define CEL roles at `ssh/cel/roles/:name`. A CEL role holds one
+`cel_program`: an ordered list of named variables and a main expression.
+
+**Users** request certificates against a CEL role exactly as they do against a classic role:
+
+- `POST ssh/cel/sign/:name` with `public_key` and the usual request fields (`valid_principals`,
+  `cert_type`, `ttl`, `key_id`, `critical_options`, `extensions`).
+- `POST ssh/cel/issue/:name` with `key_type`/`key_bits` instead of `public_key`. OpenBao
+  generates the key pair.
+
+The program decides what the certificate says. It may honour any request field, ignore it, or
+reject the request because of it. The response format is the same as `sign/` and `issue/`:
+`serial_number`, `signed_key`, `issuer_id`, plus `private_key` and `private_key_type` for
+`issue`.
+
+### Example: a certificate derived from identity
+
+The caller logged in through an OIDC mount whose aliases carry the Entra UPN as metadata. The
+certificate:
+
+- names the person and the time in `key_id`;
+- grants principals according to the caller's identity groups;
+- lets the caller choose a TTL of up to 8 hours;
+- accepts only Ed25519 and P-256 keys.
+
+```json
+{
+  "cel_program": {
+    "variables": [
+      {
+        "name": "upns",
+        "expression": "entity_info == null ? [] : entity_info.aliases.filter(a, a.mount_accessor == 'auth_oidc_8c1f3b2a' && 'upn' in a.metadata).map(a, a.metadata['upn'])"
+      },
+      {
+        "name": "upn",
+        "expression": "size(upns) == 1 ? upns[0] : ''"
+      },
+      {
+        "name": "group_principals",
+        "expression": "{'devops': ['ops', 'deploy'], 'network': ['netops']}"
+      },
+      {
+        "name": "principals",
+        "expression": "entity_groups.map(g, g.name).filter(n, n in group_principals).map(n, group_principals[n]).flatten()"
+      },
+      {
+        "name": "ttl",
+        "expression": "has(request.ttl) ? duration(request.ttl) : duration('1h')"
+      },
+      {
+        "name": "output",
+        "expression": "ValidationOutput{template: CertTemplate{cert_type: CertType.USER, key_id: upn + ':' + string(int(now)) + ':' + public_key.sha256, valid_principals: principals, valid_after: now - duration('30s'), valid_before: now + ttl, extensions: {'permit-pty': '', 'permit-agent-forwarding': ''}}}"
+      }
+    ],
+    "expression": "upn == '' ? 'no single Entra identity on this token' : size(principals) == 0 ? 'not a member of any group that maps to an SSH principal' : ttl > duration('8h') ? 'ttl may not exceed 8h' : !ssh.key_allowed(public_key, {'ed25519': [0], 'ecdsa-sha2-nistp256': [0]}) ? 'only Ed25519 and P-256 keys are accepted' : output"
+  }
+}
+```
+
+This one program replaces `key_id_format`, `default_extensions`, `allowed_users`,
+`allowed_user_key_lengths` and `max_ttl`. It also does what no role flag can: it derives
+principals from group membership and takes the UPN from one specific mount's alias.
+
+### Example: validating request fields together
+
+```json
+{
+  "cel_program": {
+    "variables": [
+      {
+        "name": "principals",
+        "expression": "has(request.valid_principals) ? request.valid_principals.split(',') : []"
+      },
+      {
+        "name": "is_host",
+        "expression": "has(request.cert_type) && request.cert_type == 'host'"
+      },
+      {
+        "name": "ttl",
+        "expression": "has(request.ttl) ? duration(request.ttl) : duration('30m')"
+      },
+      {
+        "name": "copts",
+        "expression": "has(request.critical_options) ? request.critical_options : {}"
+      },
+      {
+        "name": "host_cert",
+        "expression": "ValidationOutput{template: CertTemplate{cert_type: CertType.HOST, key_id: 'host:' + principals.join(','), valid_principals: principals, valid_after: now, valid_before: now + duration('2160h')}, issuer_ref: 'hosts-2026'}"
+      },
+      {
+        "name": "user_cert",
+        "expression": "ValidationOutput{template: CertTemplate{cert_type: CertType.USER, key_id: display_name + ':' + public_key.sha256, valid_principals: principals, valid_after: now, valid_before: now + ttl, critical_options: copts, extensions: {'permit-pty': ''}}}"
+      }
+    ],
+    "expression": "size(principals) == 0 ? 'valid_principals is required' : is_host ? (ssh.host_principals_allowed(principals, ['example.net'], false, true) ? host_cert : 'host principals must be subdomains of example.net') : !ssh.user_principals_allowed(principals, ['ops', 'backup']) ? 'principals must be drawn from: ops, backup' : ttl > mount.max_ttl ? 'ttl exceeds the mount maximum of ' + string(mount.max_ttl) : ttl > duration('1h') && !('source-address' in copts) ? 'user certificates over 1h require a source-address critical option' : 'backup' in principals && !('force-command' in copts) ? 'the backup principal requires a force-command' : !ssh.options_allowed(copts, ['source-address', 'force-command']) ? 'only source-address and force-command may be requested' : user_cert"
+  }
+}
+```
+
+### Example: wrapping a classic role
+
+The quickest way in is to keep an existing role and change only what it cannot express:
+
+```json
+{
+  "cel_program": {
+    "variables": [
+      { "name": "r", "expression": "ssh.apply_role('ops')" }
+    ],
+    "expression": "r.error != '' ? r.error : ValidationOutput{template: CertTemplate{cert_type: r.template.cert_type, key_id: r.template.key_id, valid_principals: r.template.valid_principals, valid_after: r.template.valid_after, valid_before: r.template.valid_before, extensions: r.template.extensions, critical_options: ssh.merge_options(r.template.critical_options, {'source-address': '192.0.2.0/24'})}, issuer_ref: r.issuer_ref}"
+  }
+}
+```
+
+`ssh.merge_options` is needed because CEL has no map union (see Helpers).
+
+---
+
+## Technical Description
+
+### Paths
+
+Role paths follow the classic SSH roles (`ssh/roles`, `ssh/roles/:name`); the rest follows the
+CEL best-practices RFC:
+
+| Use | Method | Path |
+|---|---|---|
+| List CEL roles | `LIST` | `ssh/cel/roles` |
+| Read a CEL role | `GET` | `ssh/cel/roles/:name` |
+| Create or replace a CEL role | `POST` | `ssh/cel/roles/:name` |
+| Update part of a CEL role | `PATCH` | `ssh/cel/roles/:name` |
+| Delete a CEL role | `DELETE` | `ssh/cel/roles/:name` |
+| Debug a CEL role | `POST` | `ssh/cel/roles/:name/debug` |
+| Sign a public key | `POST` | `ssh/cel/sign/:name` |
+| Generate and sign a key pair | `POST` | `ssh/cel/issue/:name` |
+
+Notes on these paths:
+
+- Role paths are plural for both the list and the individual role, as the engine's classic
+  `roles/` and `roles/:name` are, and as PKI's CEL roles (`pki/cel/roles/:name`) are. The
+  best-practices RFC lists at the plural `cel/roles` but puts each role at the singular
+  `cel/role/:name`; that split looks unintended, and no engine implements it (JWT auth uses the
+  singular `auth/jwt/cel/role` for both).
+- `LIST` supports `after`/`limit` pagination, as PKI's does.
+- `PATCH` runs inside a storage transaction and can replace a single variable.
+- Storage is `cel/role/<name>`.
+- The program is validated on every write (`Program.Validate`): it is parsed, the main
+  expression is type-checked, and variables are declared as `dyn`.
+
+**`debug`** evaluates the program against a supplied request but signs nothing. It returns:
+
+- each variable's value, in order;
+- the main expression's result;
+- the invariant check that *would* have run.
+
+It needs `sudo`, because its output can include identity data and the values of every
+variable.
+
+Mount-level CEL libraries (`ssh/cel/library/:name`, and a `libraries` field on roles) are left
+to the shared libraries work described in the best-practices RFC. SSH adopts them when they exist.
+
+### The CEL role
+
+```json
+{
+  "name": "string",
+  "cel_program": {
+    "variables": [ { "name": "string", "expression": "string" } ],
+    "expression": "string"
+  }
+}
+```
+
+Nothing else is stored. In line with the first tenet of the best-practices RFC, no classic role
+logic runs unless the program asks for it. That covers defaults, TTL clamping and allow-lists.
+
+The program is stored under the JSON key `cel_program`, the same as the API field, as JWT auth
+does. PKI stores it as `validation_program` while its API calls it `cel_program`; SSH should not
+copy that.
+
+### Evaluation context
+
+Expressions are compiled in the container `openbao.ssh`, so the result types below are written
+without a prefix (`CertTemplate{...}`, `CertType.USER`). The shared helper's `EvalConfig` is
+set as follows:
+
+- `WithExtLib`: the cel-go extension libraries (strings, lists, optional types, regex, math,
+  sets, encoders).
+- `WithJSON`: `encode_json` and `decode_json`.
+- `WithEmail`: `check_valid_email`.
+- `WithIdentity` is **off**. SSH declares and populates its own typed identity variables
+  instead (see below).
+
+The program sees these variables:
+
+| Variable | Type | Contents |
+|---|---|---|
+| `request` | `map(string, dyn)` | The raw request data, as PKI provides it. Field types are whatever the client sent; see Unresolved Questions. |
+| `operation` | `string` | `"sign"` or `"issue"`. |
+| `role_name` | `string` | The CEL role's name. |
+| `now` | `google.protobuf.Timestamp` | Evaluation time. It is also used when signing, so validity computed from `now` is exact. |
+| `public_key` | `SSHPublicKey` | The key to be certified (see below). |
+| `mount` | `map(string, dyn)` | `default_ttl` and `max_ttl` (durations) from the mount's system view. |
+| `display_name` | `string` | The token's display name. Today this goes into the default `key_id`. |
+| `entity_id` | `string` | The caller's entity ID, or `""`. |
+| `entity_info` | `logical.Entity` or `null` | The caller's entity with its aliases and their metadata (`sdk/logical/identity.proto`). |
+| `entity_groups` | `list(logical.Group)` | The caller's identity groups; an empty list (not `null`) when there is no entity, so comprehensions over it need no guard. |
+
+`SSHPublicKey` is a message with these fields:
+
+- `algorithm`: the key's wire-format type, e.g. `ssh-ed25519`, `ecdsa-sha2-nistp256`, `ssh-rsa`
+  or `sk-ssh-ed25519@openssh.com`.
+- `type`: the family the existing role checks use: `rsa`, `dsa`, `ecdsa` or `ed25519`.
+- `bits`: the RSA/DSA modulus length or the EC curve size; 0 for Ed25519.
+- `sha256`: hex SHA-256 of the wire-format key, the value the classic `{{public_key_hash}}`
+  uses.
+
+**`issue` generates the key pair before evaluation.** It uses the requested `key_type` and
+`key_bits` (defaults as in `issue/`), so `public_key` means the same thing for both operations
+and one program can serve both. The program may still reject the key type. The cost is a wasted
+key generation on a request that is then denied. See Unresolved Questions.
+
+**Identity is actually populated.** The shared helper has `IdentityDeclarations()` and
+`AddIdentity()`.  The PKI CEL environment declares those variables (`getCelEvalConfig`
+sets `WithIdentity: true`), but nothing in the tree calls `AddIdentity`, so they are never
+populated. The SSH engine must populate them. It must also register `logical.Entity`,
+`logical.Alias` and `logical.Group` with `cel.Types` and declare the variables with those types
+rather than `map(string, dyn)`. Then `entity_info.aliases[0].metadata['upn']` type-checks and
+evaluates.
+
+**`client_token` is deliberately not exposed.** The shared helper adds it, but an SSH program
+could copy it into `key_id` or a principal, and from there into every sshd log that records the
+certificate. This is why SSH leaves `WithIdentity` off and populates its own declarations. An
+option on the shared helper to omit the token, with typed declarations, would serve PKI as
+well.
+
+### Program result
+
+The main expression must evaluate to exactly one of:
+
+1. **`ValidationOutput`**: the request is approved, and this is the certificate.
+2. **`string`**: the request is refused, and the string is the error returned to the caller.
+3. **`false`**: the request is refused with a generic `permission denied`.
+
+Anything else, **including `true`**, is a program error. That error is reported to the caller
+as an internal error and logged with the role name.
+
+### Result types
+
+These are message types registered in the CEL environment. Fields left unset take the default
+shown.
+
+**`ValidationOutput`** is the approved result:
+
+- `template` `(CertTemplate: required)`
+  The certificate to sign.
+- `issuer_ref` `(string: "default")`
+  The issuer to sign with, by name or ID, as the classic role's `issuer_ref`.
+- `algorithm_signer` `(string: "default")`
+  The algorithm the issuer signs with, as the classic role's `algorithm_signer`: `default`,
+  `ssh-rsa`, `rsa-sha2-256` or `rsa-sha2-512`.
+- `allow_empty_principals` `(bool: false)`
+  Lets `template.valid_principals` be empty, which OpenSSH treats as valid for any principal
+  (see Security Implications). It is per request, not per role, so the program decides when a
+  wildcard certificate is acceptable.
+- `warnings` `([]string: optional)`
+  Added to the response's warnings.
+
+**`CertTemplate`** holds the parts of an OpenSSH certificate that policy decides:
+
+- `cert_type` `(CertType: required)`
+  `CertType.USER` or `CertType.HOST`.
+- `key_id` `(string: required)`
+  The certificate's key ID, which sshd logs.
+- `valid_principals` `([]string: required unless allow_empty_principals)`
+  User names for a user certificate, host names for a host certificate.
+- `valid_after`, `valid_before` `(timestamp: required)`
+  The validity window. Neither is derived from a TTL. The program computes both, usually from
+  `now`.
+- `critical_options` `(map[string]string: optional)`
+  E.g. `force-command`, `source-address`.
+- `extensions` `(map[string]string: optional)`
+  E.g. `permit-pty`, `permit-port-forwarding`. Values are usually empty.
+
+OpenBao sets the remaining certificate fields itself (see Invariants).
+
+**`CertType`** is an enumeration whose values are constants in the environment:
+`CertType.USER` (1) and `CertType.HOST` (2), the OpenSSH certificate type numbers. The plain
+integers are accepted too. PKI's types include enumerations in the same way (`KeyUsage`,
+`ExtKeyUsage`), but its tests and RFC use raw integers; SSH's examples use the names.
+
+**`RoleResult`** is what `ssh.apply_role` returns. Either `error` is set, or the rest is:
+
+- `error` `(string)`
+  Why the classic role would refuse the request: the same message `sign/:name` would return.
+- `template` `(CertTemplate)`
+  The certificate the role would sign.
+- `issuer_ref`, `algorithm_signer`, `allow_empty_principals`
+  The role's settings, in `ValidationOutput`'s terms, so they can be passed through.
+- `warnings` `([]string)`
+  Warnings the role would add, such as skipped templated extensions.
+
+### Invariants OpenBao enforces
+
+The first tenet of the best-practices RFC reserves protocol validation to OpenBao. After
+evaluation, and before signing, OpenBao checks the following, and refuses with a specific error
+if a check fails:
+
+- `cert_type` is `USER` or `HOST`.
+- `valid_after` and `valid_before` are both set, `valid_before > valid_after`, and
+  `valid_before > now`.
+- `key_id` contains no control characters.
+- Every principal, critical option name and extension name is non-empty and free of control
+  characters.
+- **`valid_principals` is non-empty unless `ValidationOutput.allow_empty_principals` is
+  true.** See Security Implications.
+- `issuer_ref` resolves, through the existing `resolveIssuerReference`, to an issuer on this
+  mount.
+- `algorithm_signer` suits that issuer's key type. The `rsa-*` and `ssh-rsa` choices need an
+  RSA issuer. `default` keeps today's mapping: `rsa-sha2-256` for RSA issuers, the key's own
+  algorithm otherwise.
+
+OpenBao sets the nonce (32 random bytes), the serial (random, as today), the certified key and
+the signature key. The program cannot set these. As today, SSH certificates are neither stored
+nor leased.
+
+The program owns validity, and **no TTL clamping is applied**. `mount.max_ttl` is in the
+context so a program can apply the mount's limit if it wants it.
+
+### Helpers
+
+The second tenet of the best-practices RFC asks for the existing role machinery to be usable
+from CEL, with results returned to the program rather than ending evaluation. All helpers live
+under the `ssh.` namespace:
+
+| Function | Returns | Equivalent role behaviour |
+|---|---|---|
+| `ssh.user_principals_allowed(list(string) requested, list(string) allowed)` | `bool` | `allowed_users`: exact match, `*` allows any. |
+| `ssh.host_principals_allowed(list(string) requested, list(string) domains, bool allow_bare, bool allow_subdomains)` | `bool` | `allowed_domains` with `allow_bare_domains` / `allow_subdomains`. |
+| `ssh.key_allowed(SSHPublicKey key, map(string, list(int)) allowed)` | `bool` | `allowed_user_key_lengths`, with the same key names (`rsa`, `ecdsa`/`ec`, `ed25519`, and algorithm names such as `ecdsa-sha2-nistp256`) and the same length rules. |
+| `ssh.options_allowed(map(string, string) requested, list(string) allowed)` | `bool` | `allowed_critical_options` / `allowed_extensions`. |
+| `ssh.merge_options(map(string, string) base, map(string, string) overlay)` | `map(string, string)` | None: a map union in which `overlay` wins. CEL has no built-in one. |
+| `ssh.apply_role(string name)` | `RoleResult` | Evaluates a stored classic role against the current request and identity, exactly as `sign/:name` would, and returns the template it would sign. |
+| `ssh.apply_role(map(string, dyn) role)` | `RoleResult` | The same, against a role built on the fly. The map takes the classic role's API fields. |
+
+`apply_role` never signs. It reports a failure through `RoleResult.error`, so the program can
+fall back, try another role, or reword the message.
+
+**Implementation note.** All of today's `calculate*` helpers (`calculateValidPrincipals`
+and its siblings) take `*framework.FieldData` and `*sshRole`. Exposing them to CEL means
+refactoring them into pure functions over plain values: the requested fields, the role's rules,
+and the identity context. `pathSignIssueCertificateHelper` then calls the same pure functions,
+so the classic and CEL paths share one implementation instead of two that drift apart.
+`creationBundle.sign()` likewise needs `NotBeforeDuration` and `AlgorithmSigner` moved off the
+role pointer and into the bundle, and has to accept explicit `ValidAfter` and `ValidBefore`
+times.
+
+---
+
+## Rationale and Alternatives
+
+**More role flags.** This is the status quo. Each flag is small, but they multiply, they
+interact in ways that are hard to document, and each new templated field brings another dialect
+(`allowed_users_template`, `default_extensions_template`, and so on). Requests to validate
+combinations of fields cannot be met this way at all.
+
+**Role-parameter CEL, as JWT auth does.** Here CEL would choose or override classic role
+fields, and the role logic would build the certificate. That is simpler, but the program could
+only express what roles can already express. It could not derive `key_id` from alias metadata,
+for example, unless `key_id_format` grew more templating. The best-practices RFC asks for full
+control at the lowest level, with role-shaped helpers as the escape hatch. `ssh.apply_role`
+gives that escape hatch without capping what the program can do.
+
+**External webhooks** (in the style of Vault's CIEPS for PKI). These give the same flexibility,
+but add an out-of-process dependency on the signing path, along with its latency and its
+availability. PKI rejected this approach for the same reasons.
+
+## Downsides
+
+- Complexity. A CEL role that builds the whole certificate must get every safety-relevant
+  detail right itself: principals, validity, options. The helpers and `apply_role` reduce this
+  but do not remove it.
+- Two role types on one mount. The engine already has OTP and CA roles under `roles/`. CEL
+  roles live in their own namespace, as they do in PKI.
+
+## Security Implications
+
+- **The program is the authorization policy.** Anyone who can write `ssh/cel/roles/*` can issue
+  any certificate the mount's issuers can sign. Treat that path like `ssh/roles/*` with
+  `allowed_users="*"`.
+
+- **Empty principals are a wildcard in OpenSSH.**
+  - A certificate with no principals passes whenever the caller does not set `require_principal`.
+  - The SSH client checks host certificates without it (`sshkey_cert_check_host()`, used by
+    `sshconnect.c`), so a host certificate with no principals is valid for **every** host that
+    trusts the CA.
+  - sshd checks user certificates trusted through an `authorized_keys` `cert-authority` line
+    without it too (`auth2-pubkeyfile.c`), as well as hostbased certificates.
+  - Only `TrustedUserCAKeys` (`auth2-pubkey.c`) requires a principal.
+
+  The classic role already refuses this case ("refusing to issue unsafe, globally-valid
+  certificate", gated by the role's `allow_empty_principals`). The CEL path refuses it the same
+  way unless the program opts in by setting `allow_empty_principals` in its `ValidationOutput`.
+
+- **Host certificates with critical options are rejected by OpenSSH clients**
+  (`sshkey_cert_check_host()`). This is not a security issue, but `debug` should warn about
+  it.
+
+- **`key_id` is logged by every sshd that accepts the certificate.** Keep personal data in it to
+  what the logs are meant to hold. Control characters are rejected so a crafted value cannot
+  forge log lines.
+
+- **Evaluation cost.** CEL is not Turing-complete, and evaluation already stops on context
+  cancellation. The shared helper sets no cost limit, though, and a program can do expensive
+  comprehensions over attacker-influenced input such as large `valid_principals` lists. This
+  RFC recommends adding a configurable `cel.CostLimit` to `sdk/helper/cel` for every engine,
+  not only SSH.
+
+- **Auditing.** The request is audited (HMAC'd) as today, and the response's `serial_number`
+  ties a certificate to its request. `debug` responses contain identity data. They are HMAC'd by
+  default like any other response field, and `debug` itself requires `sudo`.
+
+## User/Developer Experience
+
+Nothing changes for existing roles or callers. Operators who opt in can:
+
+1. wrap an existing role with `ssh.apply_role` and adjust one field;
+2. compose the per-field helpers into their own policy; or
+3. write the certificate template outright.
+
+`debug` makes all three testable before any certificate is signed. For developers, the
+refactor of the `calculate*` helpers into pure functions makes the classic role path easier to
+test as well.
+
+## Unresolved Questions
+
+- **Key generation in `issue`.** Generating before evaluation keeps `public_key` uniform. The
+  alternative is PKI's approach: put `key_type`/`key_bits` in `ValidationOutput` and generate
+  afterwards. That avoids wasted work on denials but leaves `public_key` unset during `issue`,
+  so `key_id` cannot contain the key hash. Is a wasted RSA-4096 generation per denied,
+  *authenticated* request acceptable?
+- **Typed request.** `request` is the raw map, as in PKI, so `ttl` may arrive as `"1h"` or
+  `3600` and `valid_principals` as a comma-separated string. Should SSH instead pass a typed
+  `SignRequest` message with the framework's parsing already applied?
+- **Plural role paths in the best-practices RFC.** This draft uses `cel/roles` and
+  `cel/roles/:name`, matching the classic SSH roles and PKI. Should the best-practices RFC be
+  amended to the same, leaving JWT auth's singular paths as the exception?
+- **Serial numbers.** Should the program be allowed to set the serial, for example to encode a
+  ticket number? OpenSSH KRLs revoke by serial, so this has real uses, but it also opens the
+  door to collisions.
+- **Map merging.** `ssh.merge_options` is generic. Should it be a shared-helper function
+  (`maps.merge` or similar) available to every engine?
+- **Fixing PKI's identity gap at the same time.** PKI declares the identity variables but never
+  populates them. The SSH work needs the corrected `AddIdentity`, typed entity declarations and
+  the token-less variant anyway.
+
+## Related Issues
+
+- [Best Practices for Integrating CEL](cel-best-practices.mdx)
+- [CEL Support for Certificate Issuance Policies (PKI)](cel-pki.mdx)
+- [CEL Expression Support for JWT Authentication](cel-jwt.mdx)
+- [SSH CA Multi-issuer](ssh-ca-multi-issuer.mdx), which provides the `issuer_ref` this RFC
+  resolves
+
+## Proof of Concept
+
+None yet.
